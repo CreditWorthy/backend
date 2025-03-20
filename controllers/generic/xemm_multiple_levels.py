@@ -161,6 +161,7 @@ class XEMMMultipleLevels(ControllerBase):
                 executor_actions.append(CreateExecutorAction(executor_config=config, controller_id=self.config.id))
         return executor_actions
 
+
     def to_format_status(self) -> List[str]:
         all_executors_custom_info = pd.DataFrame(e.custom_info for e in self.executors_info)
         return [format_df_for_printout(all_executors_custom_info, table_format="psql", )]

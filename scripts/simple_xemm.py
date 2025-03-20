@@ -61,38 +61,77 @@ class SimpleXEMM(ScriptStrategyBase):
         taker_buy_result = self.connectors[self.config.taker_exchange].get_price_for_volume(self.config.taker_pair, True, self.config.order_amount)
         taker_sell_result = self.connectors[self.config.taker_exchange].get_price_for_volume(self.config.taker_pair, False, self.config.order_amount)
 
+        # Check if there are any active orders first
+        active_buy_orders = [o for o in self.get_active_orders(connector_name=self.config.maker_exchange) if o.is_buy]
+        active_sell_orders = [o for o in self.get_active_orders(connector_name=self.config.maker_exchange) if not o.is_buy]
+        
+        # Update flags based on actual active orders, not just internal flags
+        self.buy_order_placed = len(active_buy_orders) > 0
+        self.sell_order_placed = len(active_sell_orders) > 0
+
+        # Calculate target prices
+        maker_buy_price = taker_sell_result.result_price * Decimal(1 - self.config.spread_bps / 10000)
+        maker_sell_price = taker_buy_result.result_price * Decimal(1 + self.config.spread_bps / 10000)
+        
+        # Calculate cancel thresholds
+        buy_cancel_threshold = taker_sell_result.result_price * Decimal(1 - self.config.min_spread_bps / 10000)
+        sell_cancel_threshold = taker_buy_result.result_price * Decimal(1 + self.config.min_spread_bps / 10000)
+
+        # Process buy orders
         if not self.buy_order_placed:
-            maker_buy_price = taker_sell_result.result_price * Decimal(1 - self.config.spread_bps / 10000)
             buy_order_amount = min(self.config.order_amount, self.buy_hedging_budget())
-
-            buy_order = OrderCandidate(trading_pair=self.config.maker_pair, is_maker=True, order_type=OrderType.LIMIT, order_side=TradeType.BUY, amount=Decimal(buy_order_amount), price=maker_buy_price)
-            buy_order_adjusted = self.connectors[self.config.maker_exchange].budget_checker.adjust_candidate(buy_order, all_or_none=False)
-            self.buy(self.config.maker_exchange, self.config.maker_pair, buy_order_adjusted.amount, buy_order_adjusted.order_type, buy_order_adjusted.price)
-            self.buy_order_placed = True
-
-        if not self.sell_order_placed:
-            maker_sell_price = taker_buy_result.result_price * Decimal(1 + self.config.spread_bps / 10000)
-            sell_order_amount = min(self.config.order_amount, self.sell_hedging_budget())
-            sell_order = OrderCandidate(trading_pair=self.config.maker_pair, is_maker=True, order_type=OrderType.LIMIT, order_side=TradeType.SELL, amount=Decimal(sell_order_amount), price=maker_sell_price)
-            sell_order_adjusted = self.connectors[self.config.maker_exchange].budget_checker.adjust_candidate(sell_order, all_or_none=False)
-            self.sell(self.config.maker_exchange, self.config.maker_pair, sell_order_adjusted.amount, sell_order_adjusted.order_type, sell_order_adjusted.price)
-            self.sell_order_placed = True
-
-        for order in self.get_active_orders(connector_name=self.config.maker_exchange):
-            cancel_timestamp = order.creation_timestamp / 1000000 + self.config.max_order_age
-            if order.is_buy:
-                buy_cancel_threshold = taker_sell_result.result_price * Decimal(1 - self.config.min_spread_bps / 10000)
-                if order.price > buy_cancel_threshold or cancel_timestamp < self.current_timestamp:
-                    self.logger().info(f"Cancelling buy order: {order.client_order_id}")
+            if buy_order_amount > Decimal("0"):
+                self.logger().info(f"Placing maker buy order at price {maker_buy_price:.6f}")
+                buy_order = OrderCandidate(trading_pair=self.config.maker_pair, is_maker=True, order_type=OrderType.LIMIT, 
+                                          order_side=TradeType.BUY, amount=buy_order_amount, price=maker_buy_price)
+                buy_order_adjusted = self.connectors[self.config.maker_exchange].budget_checker.adjust_candidate(buy_order, all_or_none=False)
+                if buy_order_adjusted.amount > Decimal("0"):
+                    self.buy(self.config.maker_exchange, self.config.maker_pair, buy_order_adjusted.amount, 
+                            buy_order_adjusted.order_type, buy_order_adjusted.price)
+                    self.buy_order_placed = True
+                else:
+                    self.logger().warning("Insufficient balance to place buy order")
+        else:
+            # Check if we need to refresh buy orders due to price changes
+            for order in active_buy_orders:
+                cancel_timestamp = order.creation_timestamp / 1000000 + self.config.max_order_age
+                price_too_high = order.price > buy_cancel_threshold
+                order_too_old = cancel_timestamp < self.current_timestamp
+                price_too_far = abs(order.price - maker_buy_price) / maker_buy_price > Decimal("0.005")  # 0.5% price deviation
+                
+                if price_too_high or order_too_old or price_too_far:
+                    reason = "spread below min" if price_too_high else "order too old" if order_too_old else "price moved significantly"
+                    self.logger().info(f"Cancelling buy order ({reason}): {order.client_order_id}")
                     self.cancel(self.config.maker_exchange, order.trading_pair, order.client_order_id)
                     self.buy_order_placed = False
-            else:
-                sell_cancel_threshold = taker_buy_result.result_price * Decimal(1 + self.config.min_spread_bps / 10000)
-                if order.price < sell_cancel_threshold or cancel_timestamp < self.current_timestamp:
-                    self.logger().info(f"Cancelling sell order: {order.client_order_id}")
+
+        # Process sell orders
+        if not self.sell_order_placed:
+            sell_order_amount = min(self.config.order_amount, self.sell_hedging_budget())
+            if sell_order_amount > Decimal("0"):
+                self.logger().info(f"Placing maker sell order at price {maker_sell_price:.6f}")
+                sell_order = OrderCandidate(trading_pair=self.config.maker_pair, is_maker=True, order_type=OrderType.LIMIT, 
+                                           order_side=TradeType.SELL, amount=sell_order_amount, price=maker_sell_price)
+                sell_order_adjusted = self.connectors[self.config.maker_exchange].budget_checker.adjust_candidate(sell_order, all_or_none=False)
+                if sell_order_adjusted.amount > Decimal("0"):
+                    self.sell(self.config.maker_exchange, self.config.maker_pair, sell_order_adjusted.amount, 
+                             sell_order_adjusted.order_type, sell_order_adjusted.price)
+                    self.sell_order_placed = True
+                else:
+                    self.logger().warning("Insufficient balance to place sell order")
+        else:
+            # Check if we need to refresh sell orders due to price changes
+            for order in active_sell_orders:
+                cancel_timestamp = order.creation_timestamp / 1000000 + self.config.max_order_age
+                price_too_low = order.price < sell_cancel_threshold
+                order_too_old = cancel_timestamp < self.current_timestamp
+                price_too_far = abs(order.price - maker_sell_price) / maker_sell_price > Decimal("0.005")  # 0.5% price deviation
+                
+                if price_too_low or order_too_old or price_too_far:
+                    reason = "spread below min" if price_too_low else "order too old" if order_too_old else "price moved significantly"
+                    self.logger().info(f"Cancelling sell order ({reason}): {order.client_order_id}")
                     self.cancel(self.config.maker_exchange, order.trading_pair, order.client_order_id)
                     self.sell_order_placed = False
-        return
 
     def buy_hedging_budget(self) -> Decimal:
         base_asset = self.config.taker_pair.split("-")[0]
@@ -115,15 +154,51 @@ class SimpleXEMM(ScriptStrategyBase):
         return False
 
     def did_fill_order(self, event: OrderFilledEvent):
+
+        if not hasattr(self, "_partial_fills"):
+            self._partial_fills = {}
+            self._hedged_amounts = {}
+
+        order_id = event.order_id
+        if order_id not in self._partial_fills:
+            self._partial_fills[order_id] = Decimal(0)
+            self._hedged_amounts[order_id] = Decimal(0)
+
+        self._partial_fills[order_id] += event.amount
+        amount_to_hedge = event.amount
+
         if event.trade_type == TradeType.BUY and self.is_active_maker_order(event):
             self.logger().info(f"Filled maker buy order at price {event.price:.6f} for amount {event.amount:.2f}")
             self.place_sell_order(self.config.taker_exchange, self.config.taker_pair, event.amount)
-            self.buy_order_placed = False
+
+            self._hedged_amounts[order_id] += amount_to_hedge
+            order_size = self.get_order_size(order_id)
+            if self._partial_fills[order_id] >= order_size:
+                self.logger().info(f"Buy order completely filled ({self._partial_fills[order_id]}/{order_size})")
+                self.buy_order_placed = False
+                del self._partial_fills[order_id]
+                del self._hedged_amounts[order_id]
+
+            # self.buy_order_placed = False
         else:
             if event.trade_type == TradeType.SELL and self.is_active_maker_order(event):
                 self.logger().info(f"Filled maker sell order at price {event.price:.6f} for amount {event.amount:.2f}")
                 self.place_buy_order(self.config.taker_exchange, self.config.taker_pair, event.amount)
-                self.sell_order_placed = False
+                self._hedged_amounts[order_id] += amount_to_hedge
+
+                order_size = self.get_order_size(order_id)
+                if self._partial_fills[order_id] >= order_size:
+                    self.logger().info(f"Sell order completely filled ({self._partial_fills[order_id]}/{order_size})")
+                    self.sell_order_placed = False
+                    del self._partial_fills[order_id]
+                    del self._hedged_amounts[order_id]
+                # self.sell_order_placed = False
+
+    def get_order_size(self, order_id):
+        for order in self.get_active_orders(connector_name=self.config.maker_exchange):
+            if order.client_order_id == order_id:
+                return order.amount
+        return self._partial_fills.get(order_id, Decimal(0))
 
     def place_buy_order(self, exchange: str, trading_pair: str, amount: Decimal, order_type: OrderType = OrderType.LIMIT):
         buy_result = self.connectors[exchange].get_price_for_volume(trading_pair, True, amount)

@@ -121,6 +121,23 @@ class XEMMExecutor(ExecutorBase):
         taker_adjusted_candidate = self.adjust_order_candidates(self.taker_connector, [taker_order_candidate])[0]
         if maker_adjusted_candidate.amount == Decimal("0") or taker_adjusted_candidate.amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
+
+            if maker_adjusted_candidate.amount == Decimal("0"):
+                required_balance = maker_order_candidate.amount
+                self.logger().error(
+                    f"Insufficient balance for maker order. "
+                    f"Required: {required_balance}"
+                    f"Reason: Unable to proceed with the requested maker order."
+                )
+
+            if taker_adjusted_candidate.amount == Decimal("0"):
+                required_balance = taker_order_candidate.amount
+                self.logger().error(
+                    f"Insufficient balance for taker order. "
+                    f"Required: {required_balance}"
+                    f"Reason: Unable to proceed with the requested taker order."
+                )
+
             self.logger().error("Not enough budget to open position.")
             self.stop()
 
@@ -217,7 +234,9 @@ class XEMMExecutor(ExecutorBase):
         self.logger().info(f"Created maker order {order_id} at price {self._maker_target_price}.")
 
     async def control_shutdown_process(self):
-        if self.maker_order.is_done and self.taker_order.is_done:
+        marker_order_done = self.maker_order is not None and self.maker_order.is_done
+        taker_order_done = self.taker_order is not None and self.taker_order.is_done
+        if marker_order_done and taker_order_done:
             self.logger().info("Both orders are done, executor terminated.")
             self.stop()
 

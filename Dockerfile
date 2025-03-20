@@ -43,6 +43,7 @@ LABEL maintainer="Fede Cardoso @dardonacci <federico@hummingbot.org>"
 ARG BRANCH=""
 ARG COMMIT=""
 ARG BUILD_DATE=""
+ARG DATE=""
 LABEL branch=${BRANCH}
 LABEL commit=${COMMIT}
 LABEL date=${BUILD_DATE}
@@ -50,7 +51,7 @@ LABEL date=${BUILD_DATE}
 # Set ENV variables
 ENV COMMIT_SHA=${COMMIT}
 ENV COMMIT_BRANCH=${BRANCH}
-ENV BUILD_DATE=${DATE}
+ENV BUILD_DATE=${DATE:-"NOT_DEFINED"}
 
 ENV INSTALLATION_TYPE=docker
 
